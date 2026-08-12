@@ -1,0 +1,10 @@
+streamlit>=1.37
+google-genai>=0.3.0
+google-cloud-firestore>=2.16
+google-cloud-storage>=2.16
+google-cloud-secret-manager>=2.20
+google-auth>=2.30
+requests>=2.31
+pydantic>=2.7
+Pillow>=10.3
+bleach>=6.1
