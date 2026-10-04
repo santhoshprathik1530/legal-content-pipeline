@@ -34,6 +34,17 @@ FIRM_CONTEXT = os.environ.get(
 
 TOPICS_COLLECTION = "topics"
 
+# E-E-A-T / attorney-review attribution shown in the enforced disclaimer (content_service.py).
+# Optional — if unset, the disclaimer falls back to a generic "a licensed Illinois attorney"
+# phrasing instead of naming anyone.
+REVIEWING_ATTORNEY_NAME = os.environ.get("REVIEWING_ATTORNEY_NAME", "")
+REVIEWING_ATTORNEY_TITLE = os.environ.get("REVIEWING_ATTORNEY_TITLE", "")
+
+# Default WordPress category assigned to every post pushed by this pipeline (see
+# wordpress_service.get_or_create_term). Posts also get per-topic tags from the SEO revision
+# step (gemini_service.seo_revise).
+WP_DEFAULT_CATEGORY = os.environ.get("WP_DEFAULT_CATEGORY", "Blog")
+
 # Social media poster branding (services/poster_service.py)
 FIRM_NAME = os.environ.get("FIRM_NAME", "Barney Hammond Law")
 POSTER_PRIMARY_COLOR = os.environ.get("POSTER_PRIMARY_COLOR", "#0B1F3A")  # navy

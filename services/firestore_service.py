@@ -112,6 +112,7 @@ def save_draft(
     meta_title: str,
     meta_description: str,
     focus_keyword: str,
+    tags: list[str] | None = None,
 ) -> None:
     update_topic(
         topic_id,
@@ -124,6 +125,7 @@ def save_draft(
         meta_title=meta_title,
         meta_description=meta_description,
         focus_keyword=focus_keyword,
+        tags=tags or [],
         error_message=firestore.DELETE_FIELD,
     )
 
@@ -144,6 +146,7 @@ def save_review_edits(
     meta_title: str,
     meta_description: str,
     focus_keyword: str,
+    tags: list[str] | None = None,
     compliance: dict | None = None,
 ) -> None:
     fields = {
@@ -153,6 +156,7 @@ def save_review_edits(
         "meta_title": meta_title,
         "meta_description": meta_description,
         "focus_keyword": focus_keyword,
+        "tags": tags or [],
         "status": models.STATUS_NEEDS_REVIEW,
     }
     if compliance is not None:

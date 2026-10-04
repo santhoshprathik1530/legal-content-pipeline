@@ -3,11 +3,14 @@
 - render_template_poster: draws the slide onto a fixed on-brand PNG template with Pillow.
   Precise, consistent text every time — the exact headline/bullets you gave it come back
   exactly as given, just laid out.
-- generate_ai_poster: asks Gemini 2.5 Flash Image to draw the whole slide from a prompt.
-  More varied/designed look, but image models aren't reliable at rendering exact multi-line
-  text — treat output as a draft to review, not a guaranteed-accurate render.
+- generate_ai_poster: generates a textless AI background image (Gemini 2.5 Flash Image), then
+  draws the same precise Pillow text layout on top of it. Image models aren't reliable at
+  rendering exact multi-line text themselves, so text is never asked of the image model —
+  only art. This gives a more varied/designed look without the misspelling risk.
 
-Both take the same slide dict ({headline, bullets}) and return PNG bytes."""
+Both text-fields are run through gemini_service's proofread pass first (spelling/typos only —
+once baked into a PNG, a mistake can't be caught by any sanitizer). Both take the same slide
+dict ({headline, bullets}) and return (png_bytes, proofread_slide)."""
 
 import functools
 import math
@@ -16,7 +19,7 @@ from io import BytesIO
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 import config
-from services import imagen_service
+from services import gemini_service, imagen_service
 
 _CANVAS_SIZE = (1080, 1350)  # Instagram portrait (4:5)
 _MARGIN = 80
@@ -122,21 +125,98 @@ def _vertical_gradient(top: tuple[int, int, int], bottom: tuple[int, int, int]) 
     return img
 
 
-def _draw_editorial_background(draw: ImageDraw.ImageDraw, index: int) -> None:
+def _draw_decorative_backdrop(draw: ImageDraw.ImageDraw, index: int) -> None:
+    """Pure full-bleed decoration (banded color, shapes, outlines). Skipped when an AI-generated
+    background image is used instead — see _draw_art_chrome."""
     width, height = _CANVAS_SIZE
     primary = _hex_to_rgb(config.POSTER_PRIMARY_COLOR)
-    accent = _hex_to_rgb(config.POSTER_ACCENT_COLOR)
     draw.rectangle([0, 0, width, 190], fill=primary)
     draw.polygon([(0, 190), (width, 120), (width, 230), (0, 300)], fill=(19, 47, 78))
-    draw.rectangle([0, height - 128, width, height], fill=_INK)
     draw.line([_MARGIN, 255, width - _MARGIN, 255], fill=_GOLD, width=4)
     for x in range(-80, width, 90):
         y = 310 + int(18 * math.sin((x + index * 35) / 85))
         draw.line([x, y, x + 52, y - 52], fill=(226, 219, 204), width=3)
     draw.ellipse([width - 300, 250, width + 170, 720], outline=(219, 211, 194), width=22)
     draw.ellipse([-180, 770, 220, 1170], outline=(225, 232, 232), width=18)
+
+
+def _draw_footer_bar(draw: ImageDraw.ImageDraw) -> None:
+    width, height = _CANVAS_SIZE
+    draw.rectangle([0, height - 128, width, height], fill=_INK)
+
+
+def _draw_content_panel(draw: ImageDraw.ImageDraw, index: int) -> None:
+    """The ivory text panel + accent bar — kept in every mode (procedural or AI background) so
+    headline/bullet text stays legible regardless of what's behind it."""
+    width, height = _CANVAS_SIZE
+    accent = _hex_to_rgb(config.POSTER_ACCENT_COLOR)
     draw.rounded_rectangle([_MARGIN, 315, width - _MARGIN, height - 190], radius=36, fill=_PAPER)
     draw.rectangle([_MARGIN, 315, _MARGIN + 18, height - 190], fill=_GOLD if index % 2 == 0 else accent)
+
+
+def _draw_editorial_background(draw: ImageDraw.ImageDraw, index: int) -> None:
+    """Full procedural background used when there's no AI-generated art layer."""
+    _draw_decorative_backdrop(draw, index)
+    _draw_footer_bar(draw)
+    _draw_content_panel(draw, index)
+
+
+def _draw_art_chrome(draw: ImageDraw.ImageDraw, index: int) -> None:
+    """Legibility chrome only, for use on top of an AI-generated background image — the
+    decorative backdrop shapes are skipped since the AI art already fills that role."""
+    _draw_footer_bar(draw)
+    _draw_content_panel(draw, index)
+
+
+def _cover_resize(img: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Resize+crop an arbitrary image to exactly fill `size`, preserving aspect ratio (like CSS
+    `background-size: cover`) — the AI model's output isn't guaranteed to be exactly 1080x1350."""
+    target_w, target_h = size
+    src_w, src_h = img.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w, new_h = max(target_w, round(src_w * scale)), max(target_h, round(src_h * scale))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    return img.crop((left, top, left + target_w, top + target_h))
+
+
+def _prepare_background(image_bytes: bytes) -> Image.Image:
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    return _cover_resize(img, _CANVAS_SIZE)
+
+
+def _background_art_prompt(kind: str, mood_hint: str) -> str:
+    """Prompt for a textless AI background layer. Real text is drawn on top afterward by
+    Pillow (see _draw_art_chrome) — asking an image model to render exact multi-line text
+    itself is unreliable (misspellings, garbled letterforms), so this prompt explicitly
+    forbids it instead of requesting it."""
+    return (
+        f"Design a premium editorial background image (portrait, 4:5 aspect ratio, full-bleed, "
+        f"no borders) for {kind} for {config.FIRM_NAME}, a personal injury law firm.\n\n"
+        "Style: premium editorial legal marketing graphic, layered paper texture, subtle "
+        "courthouse or document silhouettes, confident composition, navy, ivory, muted gold, "
+        "and restrained teal accents. Real visual depth and texture, not a flat color.\n\n"
+        f'Mood/imagery should evoke this idea (for atmosphere only, not literally): "{mood_hint}"\n\n'
+        "CRITICAL: this is a background layer only — real text will be overlaid on top of it "
+        "afterward by a separate process. Do NOT render any text, words, letters, numbers, "
+        "logos, or watermarks anywhere in the image. Keep the lower two-thirds of the frame "
+        "visually calm and lower-contrast so the overlaid text stays legible."
+    )
+
+
+def _proofread_slide(slide: dict) -> dict:
+    headline, bullets = gemini_service.proofread_slide(
+        slide.get("headline", ""), [b for b in (slide.get("bullets") or [])]
+    )
+    return {**slide, "headline": headline, "bullets": bullets}
+
+
+def _proofread_content(content: dict) -> dict:
+    fixed = gemini_service.proofread_poster_content(
+        content.get("headline", ""), content.get("supporting_text", ""), content.get("cta", "")
+    )
+    return {**content, **fixed}
 
 
 def _draw_kicker(draw: ImageDraw.ImageDraw, text: str, x: int, y: int, fill: tuple[int, int, int]) -> None:
@@ -197,16 +277,23 @@ def _draw_logo(img: Image.Image) -> None:
         )
 
 
-def render_template_poster(slide: dict, index: int, total: int) -> bytes:
+def _compose_slide_poster(slide: dict, index: int, total: int, background: Image.Image | None) -> bytes:
+    """Pure drawing — assumes `slide` text has already been proofread by the public entry
+    points below. `background`, when given, is an AI-generated art layer (already cover-resized
+    to canvas size); otherwise the procedural gradient/backdrop is used."""
     primary = _hex_to_rgb(config.POSTER_PRIMARY_COLOR)
     accent = _hex_to_rgb(config.POSTER_ACCENT_COLOR)
     white = (255, 255, 255)
 
     width, height = _CANVAS_SIZE
-    img = _vertical_gradient((246, 248, 250), _WARM)
-    draw = ImageDraw.Draw(img)
-
-    _draw_editorial_background(draw, index)
+    if background is not None:
+        img = background.copy()
+        draw = ImageDraw.Draw(img)
+        _draw_art_chrome(draw, index)
+    else:
+        img = _vertical_gradient((246, 248, 250), _WARM)
+        draw = ImageDraw.Draw(img)
+        _draw_editorial_background(draw, index)
     _draw_logo(img)
 
     headline = slide.get("headline", "")
@@ -302,33 +389,44 @@ def render_template_poster(slide: dict, index: int, total: int) -> bytes:
     return buf.getvalue()
 
 
-def generate_ai_poster(slide: dict, index: int, total: int) -> bytes:
+def render_template_poster(slide: dict, index: int, total: int) -> tuple[bytes, dict]:
+    """Editorial template render: proofreads the slide text, then draws it on the procedural
+    on-brand background. Returns (png_bytes, proofread_slide) — callers should persist the
+    returned slide dict so a corrected typo isn't lost/re-shown as the original on next edit."""
+    slide = _proofread_slide(slide)
+    return _compose_slide_poster(slide, index, total, background=None), slide
+
+
+def generate_ai_poster(slide: dict, index: int, total: int) -> tuple[bytes, dict]:
+    """AI-concept render: generates a textless AI background image, then draws the (proofread)
+    slide text on top with the same precise Pillow layout used by render_template_poster —
+    rather than asking the image model to render the text itself, which is unreliable at
+    exact spelling. Returns (png_bytes, proofread_slide)."""
+    slide = _proofread_slide(slide)
     bullets = [b for b in (slide.get("bullets") or []) if b.strip()]
-    bullets_block = "\n".join(f"- {b}" for b in bullets)
-    prompt = (
-        f"Design a clean, modern social media carousel slide (portrait, 4:5 aspect ratio) "
-        f"for {config.FIRM_NAME}, a personal injury law firm. This is slide {index + 1} of "
-        f"{total}.\n\n"
-        f'Headline text to display prominently: "{slide.get("headline", "")}"\n'
-        + (f"Bullet points to display below it:\n{bullets_block}\n\n" if bullets_block else "\n")
-        + "Style: premium editorial legal marketing graphic, layered paper texture, subtle "
-        "courthouse or document silhouettes, confident typography, navy, ivory, muted gold, "
-        "and restrained teal accents. Use real visual composition, not plain text on a flat "
-        "background. Render the headline and bullet text exactly as given, spelled correctly, "
-        "large and legible. Do not add any other text, logos, or watermarks."
+    mood_hint = slide.get("headline", "") + ((" — " + "; ".join(bullets)) if bullets else "")
+    bg_bytes = imagen_service.generate_from_prompt(
+        _background_art_prompt(f"a social media carousel slide {index + 1} of {total}", mood_hint)
     )
-    return imagen_service.generate_from_prompt(prompt)
+    background = _prepare_background(bg_bytes)
+    return _compose_slide_poster(slide, index, total, background=background), slide
 
 
-def render_single_poster(content: dict) -> bytes:
+def _compose_single_poster(content: dict, background: Image.Image | None) -> bytes:
+    """Pure drawing — assumes `content` text has already been proofread by the public entry
+    points below."""
     primary = _hex_to_rgb(config.POSTER_PRIMARY_COLOR)
     accent = _hex_to_rgb(config.POSTER_ACCENT_COLOR)
 
     width, height = _CANVAS_SIZE
-    img = _vertical_gradient((247, 248, 246), (229, 236, 235))
-    draw = ImageDraw.Draw(img)
-
-    _draw_editorial_background(draw, 0)
+    if background is not None:
+        img = background.copy()
+        draw = ImageDraw.Draw(img)
+        _draw_art_chrome(draw, 0)
+    else:
+        img = _vertical_gradient((247, 248, 246), (229, 236, 235))
+        draw = ImageDraw.Draw(img)
+        _draw_editorial_background(draw, 0)
     _draw_logo(img)
 
     headline = content.get("headline", "")
@@ -383,18 +481,24 @@ def render_single_poster(content: dict) -> bytes:
     return buf.getvalue()
 
 
-def generate_ai_single_poster(content: dict) -> bytes:
-    prompt = (
-        f"Design a clean, modern single social media graphic (portrait, 4:5 aspect ratio) "
-        f"for {config.FIRM_NAME}, a personal injury law firm — a single bold-statement post, "
-        "not a multi-slide carousel.\n\n"
-        f'Headline text to display prominently: "{content.get("headline", "")}"\n'
-        f'Supporting line below it: "{content.get("supporting_text", "")}"\n'
-        f'Call-to-action text near the bottom: "{content.get("cta", "")}"\n\n'
-        "Style: premium editorial legal marketing graphic, layered paper texture, subtle "
-        "courthouse/document silhouettes, navy, ivory, muted gold, and restrained teal accents. "
-        "It should look like a polished law-firm campaign asset, not text on a flat color. "
-        "Render all three text elements exactly as given, spelled correctly, large and legible. "
-        "Do not add any other text, logos, or watermarks."
+def render_single_poster(content: dict) -> tuple[bytes, dict]:
+    """Editorial template render: proofreads the content, then draws it on the procedural
+    on-brand background. Returns (png_bytes, proofread_content)."""
+    content = _proofread_content(content)
+    return _compose_single_poster(content, background=None), content
+
+
+def generate_ai_single_poster(content: dict) -> tuple[bytes, dict]:
+    """AI-concept render: generates a textless AI background image, then draws the (proofread)
+    content on top with the same precise Pillow layout used by render_single_poster. Returns
+    (png_bytes, proofread_content)."""
+    content = _proofread_content(content)
+    mood_hint = (
+        f'{content.get("headline", "")} — {content.get("supporting_text", "")} '
+        f'({content.get("cta", "")})'
     )
-    return imagen_service.generate_from_prompt(prompt)
+    bg_bytes = imagen_service.generate_from_prompt(
+        _background_art_prompt("a single bold-statement social media graphic", mood_hint)
+    )
+    background = _prepare_background(bg_bytes)
+    return _compose_single_poster(content, background=background), content

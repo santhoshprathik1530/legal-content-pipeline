@@ -38,7 +38,9 @@ def _auth() -> requests.auth.HTTPBasicAuth:
     return requests.auth.HTTPBasicAuth(config.WP_USERNAME, _get_app_password())
 
 
-def upload_media(image_bytes: bytes, filename: str, content_type: str = "image/png") -> int:
+def upload_media(
+    image_bytes: bytes, filename: str, content_type: str = "image/png", alt_text: str | None = None
+) -> int:
     url = f"{config.WP_URL}/wp-json/wp/v2/media"
     headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
@@ -47,6 +49,33 @@ def upload_media(image_bytes: bytes, filename: str, content_type: str = "image/p
     resp = requests.post(
         url, headers=headers, data=image_bytes, auth=_auth(), timeout=60
     )
+    resp.raise_for_status()
+    media_id = resp.json()["id"]
+    if alt_text:
+        # The media-upload endpoint only accepts the raw binary body, not JSON fields like
+        # alt_text — it has to be set in a separate follow-up call against the created item.
+        update_resp = requests.post(
+            f"{config.WP_URL}/wp-json/wp/v2/media/{media_id}",
+            json={"alt_text": alt_text},
+            auth=_auth(),
+            timeout=30,
+        )
+        update_resp.raise_for_status()
+    return media_id
+
+
+def get_or_create_term(taxonomy: str, name: str) -> int:
+    """Resolves a category/tag name to its WordPress term id, creating the term if it doesn't
+    exist yet. The core REST API's posts endpoint only accepts term IDs for `categories`/`tags`,
+    not free-text names, so this is the lookup-or-create step that lets the pipeline assign
+    categories/tags by name."""
+    url = f"{config.WP_URL}/wp-json/wp/v2/{taxonomy}"
+    resp = requests.get(url, params={"search": name, "per_page": 100}, auth=_auth(), timeout=30)
+    resp.raise_for_status()
+    for term in resp.json():
+        if term["name"].strip().lower() == name.strip().lower():
+            return term["id"]
+    resp = requests.post(url, json={"name": name}, auth=_auth(), timeout=30)
     resp.raise_for_status()
     return resp.json()["id"]
 
@@ -80,6 +109,8 @@ def create_draft_post(
     slug: str | None = None,
     excerpt: str | None = None,
     meta: dict | None = None,
+    category_ids: list[int] | None = None,
+    tag_ids: list[int] | None = None,
 ) -> int:
     url = f"{config.WP_URL}/wp-json/wp/v2/posts"
     payload = {
@@ -94,6 +125,10 @@ def create_draft_post(
         payload["excerpt"] = excerpt
     if meta:
         payload["meta"] = meta
+    if category_ids:
+        payload["categories"] = category_ids
+    if tag_ids:
+        payload["tags"] = tag_ids
     resp = requests.post(url, json=payload, auth=_auth(), timeout=60)
     if resp.status_code == 400 and meta:
         payload.pop("meta", None)

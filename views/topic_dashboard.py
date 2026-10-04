@@ -3,7 +3,7 @@
 import streamlit as st
 
 import models
-from services import firestore_service, gemini_service, imagen_service, storage_service
+from services import content_service, firestore_service, gemini_service, imagen_service, storage_service
 
 _STATUS_BADGE = {
     models.STATUS_NEW: "🆕",
@@ -21,19 +21,24 @@ def _draft_content(topic_id: str, title: str, description: str) -> None:
     try:
         blog = gemini_service.generate_blog_post(title, description)
         seo = gemini_service.seo_revise(blog["title"], blog["html"], description)
-        image_prompt = gemini_service.generate_image_prompt(seo["title"], seo["html"])
+        # Server-enforced, not left to the model to remember: guarantees every draft carries
+        # the attorney-review/disclaimer paragraph from the moment a reviewer first sees it,
+        # rather than depending on the compliance checker just nagging about its absence.
+        html = content_service.ensure_disclaimer(seo["html"])
+        image_prompt = gemini_service.generate_image_prompt(seo["title"], html)
         image_bytes = imagen_service.generate_image(image_prompt)
         gcs_uri = storage_service.upload_image(topic_id, image_bytes)
         firestore_service.save_draft(
             topic_id,
             title=seo["title"],
-            draft_html=seo["html"],
+            draft_html=html,
             captions=blog["captions"],
             image_gcs_uri=gcs_uri,
             image_prompt=image_prompt,
             meta_title=seo["meta_title"],
             meta_description=seo["meta_description"],
             focus_keyword=seo["focus_keyword"],
+            tags=seo.get("tags", []),
         )
     except Exception as exc:  # noqa: BLE001 — surfaced to the user, not swallowed
         firestore_service.mark_failed(topic_id, str(exc), revert_to=models.STATUS_FAILED)

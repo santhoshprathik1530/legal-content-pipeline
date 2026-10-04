@@ -7,6 +7,41 @@ from dataclasses import dataclass
 
 import bleach
 
+import config
+
+
+# Plain-text substring used to detect an existing disclaimer paragraph. Deliberately not a CSS
+# class/attribute marker: sanitize_html's ALLOWED_ATTRIBUTES strips any attribute on <p>, so an
+# attribute-based marker would vanish the first time a reviewer saves edited HTML, breaking
+# idempotency (the disclaimer would keep getting re-appended). Plain text content always
+# survives sanitization since <p>/<em> are already-allowed tags.
+_DISCLAIMER_MARKER = "does not constitute legal advice"
+
+
+def _disclaimer_text() -> str:
+    if config.REVIEWING_ATTORNEY_NAME:
+        title = f", {config.REVIEWING_ATTORNEY_TITLE}" if config.REVIEWING_ATTORNEY_TITLE else ""
+        reviewer = f"{config.REVIEWING_ATTORNEY_NAME}{title} at {config.FIRM_NAME}"
+    else:
+        reviewer = f"a licensed Illinois attorney at {config.FIRM_NAME}"
+    return (
+        f"This article was reviewed by {reviewer} prior to publication. It is provided for "
+        "general informational purposes only, does not constitute legal advice, and does not "
+        f"create an attorney-client relationship. For guidance on your specific situation, "
+        f"contact {config.FIRM_NAME} for a free consultation."
+    )
+
+
+def ensure_disclaimer(html: str) -> str:
+    """Appends a fixed attorney-review/disclaimer paragraph if one isn't already present.
+    Idempotent, so this is safe to call repeatedly — e.g. once when a draft is generated (so
+    reviewers see it during review) and again right before the WordPress push as a
+    server-enforced guarantee, in case it was edited out along the way."""
+    html = html or ""
+    if _DISCLAIMER_MARKER in html.lower():
+        return html
+    return f"{html}\n<p><em>{_disclaimer_text()}</em></p>"
+
 
 ALLOWED_TAGS = [
     "a",
@@ -36,13 +71,10 @@ RISK_PATTERNS = {
         r"\bno fee unless we win\b",
         r"\bmaximum compensation\b",
         r"\bget you paid\b",
-    ],
-    "Potential legal advice phrasing": [
-        r"\byou should\b",
-        r"\byou must\b",
-        r"\byou need to\b",
-        r"\bnever\b",
-        r"\balways\b",
+        # "always"/"never" alone are genre-normal in safety-tip copy ("always seek medical
+        # attention", "never admit fault") — only flag them combined with an outcome verb,
+        # which is the actually risky construction ("we will never lose", "you'll always win").
+        r"\b(always|never)\s+(win|lose|guarantee)s?\b",
     ],
     "Statute or deadline claim": [
         r"\bstatute of limitations\b",
@@ -56,6 +88,21 @@ RISK_PATTERNS = {
         r"\btestimonial\b",
         r"\bcase result\b",
     ],
+    # Directive phrasing ("you should see a doctor") is normal in how-to/process content and
+    # fires on almost every post — kept for awareness (see CATEGORY_SEVERITY) but not treated
+    # as a hard compliance signal the way outcome/testimonial/deadline claims are.
+    "Directive phrasing": [
+        r"\byou should\b",
+        r"\byou must\b",
+        r"\byou need to\b",
+    ],
+}
+
+CATEGORY_SEVERITY = {
+    "Outcome guarantee language": "high",
+    "Statute or deadline claim": "medium",
+    "Testimonial-like wording": "medium",
+    "Directive phrasing": "low",
 }
 
 
@@ -105,7 +152,7 @@ def compliance_issues(title: str, html: str) -> list[dict]:
                 issues.append(
                     ComplianceIssue(
                         category=category,
-                        severity="high" if "guarantee" in category.lower() else "medium",
+                        severity=CATEGORY_SEVERITY[category],
                         snippet=_snippet(text, match.start(), match.end()),
                     )
                 )

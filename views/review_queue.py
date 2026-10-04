@@ -6,6 +6,7 @@ from io import BytesIO
 
 import streamlit as st
 
+import config
 import models
 from services import (
     auth_service,
@@ -19,6 +20,23 @@ from services import (
 )
 
 
+def _resolve_terms(taxonomy: str, names: list[str]) -> tuple[list[int], list[str]]:
+    """Resolves category/tag names to WordPress term IDs, best-effort. A WP user without
+    term-creation capability (e.g. the 'Author' role) gets a 403 trying to create a term that
+    doesn't exist yet — that shouldn't block the whole push, so a failed name is skipped and
+    reported back instead of raised."""
+    ids: list[int] = []
+    failed: list[str] = []
+    for name in names:
+        if not name.strip():
+            continue
+        try:
+            ids.append(wordpress_service.get_or_create_term(taxonomy, name))
+        except Exception:  # noqa: BLE001 — best-effort, caller decides how to surface this
+            failed.append(name)
+    return ids, failed
+
+
 def _push_to_wordpress(
     topic_id: str,
     title: str,
@@ -28,6 +46,7 @@ def _push_to_wordpress(
     meta_title: str,
     meta_description: str,
     focus_keyword: str,
+    tags: list[str],
 ) -> None:
     try:
         approver = auth_service.get_current_user_email()
@@ -43,15 +62,28 @@ def _push_to_wordpress(
         return
 
     try:
-        clean_html = content_service.sanitize_html(html)
+        # Final server-enforced guarantee — belt-and-suspenders on top of the disclaimer
+        # already added at draft time, in case it was edited out during review.
+        clean_html = content_service.ensure_disclaimer(content_service.sanitize_html(html))
         slug = wordpress_service.topic_slug(topic_id, title)
         media_id = topic.get("wp_media_id")
         if not media_id:
-            media_id = wordpress_service.upload_media(image_bytes, filename=f"{topic_id}.png")
+            media_id = wordpress_service.upload_media(
+                image_bytes, filename=f"{topic_id}.png", alt_text=title
+            )
             firestore_service.record_wp_media(topic_id, media_id)
 
         post_id = topic.get("wp_post_id") or wordpress_service.find_post_by_slug(slug)
         if not post_id:
+            category_ids, failed_categories = _resolve_terms("categories", [config.WP_DEFAULT_CATEGORY])
+            tag_ids, failed_tags = _resolve_terms("tags", tags)
+            failed_terms = failed_categories + failed_tags
+            if failed_terms:
+                st.warning(
+                    "Couldn't assign these categories/tags (the WordPress app-password user may "
+                    "lack permission to create new terms) — pushing the post without them: "
+                    + ", ".join(failed_terms)
+                )
             post_id = wordpress_service.create_draft_post(
                 title,
                 clean_html,
@@ -63,6 +95,8 @@ def _push_to_wordpress(
                     "rank_math_description": meta_description,
                     "rank_math_focus_keyword": focus_keyword,
                 },
+                category_ids=category_ids,
+                tag_ids=tag_ids,
             )
             firestore_service.record_wp_post(topic_id, post_id)
         firestore_service.mark_pushed(
@@ -101,7 +135,7 @@ def _render_posters_section(topic: dict, topic_id: str) -> None:
             with st.spinner("Rendering the full carousel with the editorial template..."):
                 try:
                     for i, slide in enumerate(slides):
-                        img_bytes = poster_service.render_template_poster(slide, i, len(slides))
+                        img_bytes, slide = poster_service.render_template_poster(slide, i, len(slides))
                         gcs_uri = storage_service.upload_bytes(
                             f"{topic_id}/posters/slide_{i}_editorial.png",
                             img_bytes,
@@ -150,10 +184,14 @@ def _render_posters_section(topic: dict, topic_id: str) -> None:
                 with st.spinner("Rendering..."):
                     try:
                         if style == "Editorial template":
-                            img_bytes = poster_service.render_template_poster(edited_slide, i, len(slides))
+                            img_bytes, edited_slide = poster_service.render_template_poster(
+                                edited_slide, i, len(slides)
+                            )
                             method = "editorial-template"
                         else:
-                            img_bytes = poster_service.generate_ai_poster(edited_slide, i, len(slides))
+                            img_bytes, edited_slide = poster_service.generate_ai_poster(
+                                edited_slide, i, len(slides)
+                            )
                             method = "ai-concept"
                         gcs_uri = storage_service.upload_bytes(
                             f"{topic_id}/posters/slide_{i}_{method}.png", img_bytes, "image/png"
@@ -246,10 +284,10 @@ def _render_single_poster_section(topic: dict, topic_id: str) -> None:
         with st.spinner("Rendering..."):
             try:
                 if style == "Editorial template":
-                    img_bytes = poster_service.render_single_poster(edited_content)
+                    img_bytes, edited_content = poster_service.render_single_poster(edited_content)
                     method = "editorial-template"
                 else:
-                    img_bytes = poster_service.generate_ai_single_poster(edited_content)
+                    img_bytes, edited_content = poster_service.generate_ai_single_poster(edited_content)
                     method = "ai-concept"
                 gcs_uri = storage_service.upload_bytes(
                     f"{topic_id}/posters/single_{method}.png", img_bytes, "image/png"
@@ -329,6 +367,12 @@ def render() -> None:
         edited_focus_keyword = st.text_input(
             "Focus keyword", value=topic.get("focus_keyword", ""), key=f"focus_kw_{topic_id}"
         )
+        edited_tags_text = st.text_input(
+            "Tags (comma-separated — used as WordPress post tags on push)",
+            value=", ".join(topic.get("tags", []) or []),
+            key=f"tags_{topic_id}",
+        )
+        edited_tags = [t.strip() for t in edited_tags_text.split(",") if t.strip()]
 
     compliance = content_service.compliance_summary(edited_title, sanitized_html)
     with st.expander(f"Compliance QA: {compliance['status']}", expanded=bool(compliance["issues"])):
@@ -393,6 +437,7 @@ def render() -> None:
                 meta_title=edited_meta_title.strip(),
                 meta_description=edited_meta_description.strip(),
                 focus_keyword=edited_focus_keyword.strip(),
+                tags=edited_tags,
                 compliance=compliance,
             )
             st.success("Saved edits.")
@@ -409,6 +454,7 @@ def render() -> None:
                     meta_title=edited_meta_title.strip(),
                     meta_description=edited_meta_description.strip(),
                     focus_keyword=edited_focus_keyword.strip(),
+                    tags=edited_tags,
                     compliance=compliance,
                 )
                 firestore_service.mark_needs_revision(topic_id, revision_note.strip())
@@ -432,6 +478,7 @@ def render() -> None:
                 meta_title=edited_meta_title.strip(),
                 meta_description=edited_meta_description.strip(),
                 focus_keyword=edited_focus_keyword.strip(),
+                tags=edited_tags,
                 compliance=compliance,
             )
             with st.spinner("Uploading media and creating WordPress draft..."):
@@ -444,6 +491,7 @@ def render() -> None:
                     edited_meta_title.strip(),
                     edited_meta_description.strip(),
                     edited_focus_keyword.strip(),
+                    edited_tags,
                 )
 
     st.divider()

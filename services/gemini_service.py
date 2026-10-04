@@ -44,12 +44,24 @@ class ImagePromptResult(BaseModel):
     prompt: str
 
 
+class ProofreadSlide(BaseModel):
+    headline: str
+    bullets: list[str]
+
+
+class ProofreadPosterContent(BaseModel):
+    headline: str
+    supporting_text: str
+    cta: str
+
+
 class SEORevision(BaseModel):
     title: str
     html: str
     meta_title: str
     meta_description: str
     focus_keyword: str
+    tags: list[str]
 
 
 class CarouselSlide(BaseModel):
@@ -128,7 +140,10 @@ def seo_revise(title: str, html: str, description: str) -> dict:
         "and length — this is a polish pass, not a rewrite.\n"
         "- Write a meta_title (50-60 characters).\n"
         "- Write a meta_description (150-160 characters) that's compelling and accurate.\n"
-        "- Pick one focus_keyword (a realistic search phrase a prospective client would use)."
+        "- Pick one focus_keyword (a realistic search phrase a prospective client would use).\n"
+        "- Suggest 3-5 tags: short WordPress tag phrases (1-3 words each) for on-site "
+        "categorization/related-posts, e.g. practice area, injury type, or legal concept — not "
+        "full sentences."
     )
     result: SEORevision = _generate_structured(prompt, SEORevision)
     return result.model_dump()
@@ -174,6 +189,40 @@ def generate_single_poster(title: str, html: str) -> dict:
         "- cta: a short call-to-action (under 8 words), e.g. inviting a free consultation."
     )
     result: SinglePosterContent = _generate_structured(prompt, SinglePosterContent)
+    return result.model_dump()
+
+
+def proofread_slide(headline: str, bullets: list[str]) -> tuple[str, list[str]]:
+    """Fixes spelling errors/typos/duplicated words in carousel slide text before it gets
+    rendered into an image — once baked into a PNG, a typo can't be caught by any sanitizer
+    and is easy for a reviewer to miss on a skim. Meaning, wording, and bullet count/order are
+    left untouched; this is a spelling pass, not a rewrite."""
+    if not headline.strip() and not any(b.strip() for b in bullets):
+        return headline, bullets
+    prompt = (
+        "Proofread this short marketing copy for a law firm's social media graphic. Fix ONLY "
+        "spelling errors, typos, and accidental duplicated words. Do not change wording, "
+        "meaning, tone, or length otherwise. Keep exactly the same number of bullets, in the "
+        "same order. If there are no errors, return the text unchanged.\n\n"
+        f"Headline: {headline}\n" + "\n".join(f"Bullet: {b}" for b in bullets)
+    )
+    result: ProofreadSlide = _generate_structured(prompt, ProofreadSlide)
+    bullets_out = result.bullets if len(result.bullets) == len(bullets) else bullets
+    return result.headline, bullets_out
+
+
+def proofread_poster_content(headline: str, supporting_text: str, cta: str) -> dict:
+    """Same spelling-only proofread pass as proofread_slide, for the single-poster fields."""
+    if not headline.strip() and not supporting_text.strip() and not cta.strip():
+        return {"headline": headline, "supporting_text": supporting_text, "cta": cta}
+    prompt = (
+        "Proofread this short marketing copy for a law firm's social media graphic. Fix ONLY "
+        "spelling errors, typos, and accidental duplicated words. Do not change wording, "
+        "meaning, tone, or length otherwise. If there are no errors, return the text "
+        "unchanged.\n\n"
+        f"Headline: {headline}\nSupporting text: {supporting_text}\nCall to action: {cta}"
+    )
+    result: ProofreadPosterContent = _generate_structured(prompt, ProofreadPosterContent)
     return result.model_dump()
 
 
